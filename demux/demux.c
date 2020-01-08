@@ -105,6 +105,8 @@ struct demux_opts {
 
 #define MAX_BYTES MPMIN(INT64_MAX, SIZE_MAX / 2)
 
+static bool get_demux_sub_opts(int index, const struct m_sub_options **sub);
+
 const struct m_sub_options demux_conf = {
     .opts = (const struct m_option[]){
         OPT_CHOICE("cache", enable_cache, 0,
@@ -151,6 +153,7 @@ const struct m_sub_options demux_conf = {
         },
         .meta_cp = "utf-8",
     },
+    .get_sub_options = get_demux_sub_opts,
 };
 
 struct demux_internal {
@@ -337,6 +340,7 @@ struct demux_queue {
     bool correct_dts;       // packet DTS is strictly monotonically increasing
     bool correct_pos;       // packet pos is strictly monotonically increasing
     int64_t last_pos;       // for determining correct_pos
+    int64_t last_pos_fixup; // for filling in unset dp->pos values
     double last_dts;        // for determining correct_dts
     double last_ts;         // timestamp of the last packet added to queue
 
@@ -741,6 +745,7 @@ static void clear_queue(struct demux_queue *queue)
     queue->correct_dts = queue->correct_pos = true;
     queue->last_pos = -1;
     queue->last_ts = queue->last_dts = MP_NOPTS_VALUE;
+    queue->last_pos_fixup = -1;
 
     queue->is_eof = false;
     queue->is_bof = false;
@@ -1761,6 +1766,8 @@ static void attempt_range_joining(struct demux_internal *in)
         q1->keyframe_latest = q2->keyframe_latest;
         q1->is_eof = q2->is_eof;
 
+        q1->last_pos_fixup = -1;
+
         q2->head = q2->tail = NULL;
         q2->keyframe_first = NULL;
         q2->keyframe_latest = NULL;
@@ -1996,6 +2003,15 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
     struct demux_queue *queue = ds->queue;
 
     bool drop = !ds->selected || in->seeking || ds->sh->attached_picture;
+
+    if (!drop) {
+        // If libavformat splits packets, some packets will have pos unset, so
+        // make up one based on the first packet => makes refresh seeks work.
+        if (dp->pos < 0 && !dp->keyframe && queue->last_pos_fixup >= 0)
+            dp->pos = queue->last_pos_fixup + 1;
+        queue->last_pos_fixup = dp->pos;
+    }
+
     if (!drop && ds->refreshing) {
         // Resume reading once the old position was reached (i.e. we start
         // returning packets where we left off before the refresh).
@@ -2378,6 +2394,9 @@ static void execute_seek(struct demux_internal *in)
         !(flags & (SEEK_FORWARD | SEEK_FACTOR)) &&
         pts <= in->d_thread->start_time;
 
+    for (int n = 0; n < in->num_streams; n++)
+        in->streams[n]->ds->queue->last_pos_fixup = -1;
+
     if (in->recorder)
         mp_recorder_mark_discontinuity(in->recorder);
 
@@ -2444,8 +2463,8 @@ static void update_opts(struct demux_internal *in)
             mp_recorder_destroy(in->recorder);
             in->recorder = NULL;
         }
-        in->record_filename = talloc_strdup(in, opts->record_file);
         talloc_free(in->record_filename);
+        in->record_filename = talloc_strdup(in, opts->record_file);
         // Note: actual recording only starts once packets are read. It may be
         // important to delay creating in->recorder to that point, because the
         // demuxer might detect more streams until finding the first packet.
@@ -4481,4 +4500,12 @@ static void demux_convert_tags_charset(struct demuxer *demuxer)
     }
 
     talloc_free(data);
+}
+
+static bool get_demux_sub_opts(int index, const struct m_sub_options **sub)
+{
+    if (!demuxer_list[index])
+        return false;
+    *sub = demuxer_list[index]->options;
+    return true;
 }

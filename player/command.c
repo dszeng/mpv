@@ -104,6 +104,8 @@ struct command_ctx {
     struct mp_cmd_ctx *cache_dump_cmd; // in progress cache dumping
 
     char **script_props;
+
+    double cached_window_scale;
 };
 
 static const struct m_option script_props_type = {
@@ -2329,11 +2331,19 @@ static int mp_property_hidpi_scale(void *ctx, struct m_property *prop,
                                    int action, void *arg)
 {
     MPContext *mpctx = ctx;
+    struct command_ctx *cmd = mpctx->command_ctx;
     struct vo *vo = mpctx->video_out;
-    double scale = 0;
-    if (!vo || vo_control(vo, VOCTRL_GET_HIDPI_SCALE, &scale) < 1 || scale <= 0)
+    if (!vo)
         return M_PROPERTY_UNAVAILABLE;
-    return m_property_double_ro(action, arg, scale);
+    if (!cmd->cached_window_scale) {
+        double scale = 0;
+        if (vo_control(vo, VOCTRL_GET_HIDPI_SCALE, &scale) < 1 || !scale)
+            scale = -1;
+        cmd->cached_window_scale = scale;
+    }
+    if (cmd->cached_window_scale < 0)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_double_ro(action, arg, cmd->cached_window_scale);
 }
 
 static int mp_property_display_names(void *ctx, struct m_property *prop,
@@ -2455,28 +2465,31 @@ static int mp_property_vo(void *ctx, struct m_property *p, int action, void *arg
                     mpctx->video_out ? mpctx->video_out->driver->name : NULL);
 }
 
-static int mp_property_osd_w(void *ctx, struct m_property *prop,
-                             int action, void *arg)
-{
-    MPContext *mpctx = ctx;
-    struct mp_osd_res vo_res = osd_get_vo_res(mpctx->osd);
-    return m_property_int_ro(action, arg, vo_res.w);
-}
-
-static int mp_property_osd_h(void *ctx, struct m_property *prop,
-                             int action, void *arg)
-{
-    MPContext *mpctx = ctx;
-    struct mp_osd_res vo_res = osd_get_vo_res(mpctx->osd);
-    return m_property_int_ro(action, arg, vo_res.h);
-}
-
-static int mp_property_osd_par(void *ctx, struct m_property *prop,
+static int mp_property_osd_dim(void *ctx, struct m_property *prop,
                                int action, void *arg)
 {
     MPContext *mpctx = ctx;
     struct mp_osd_res vo_res = osd_get_vo_res(mpctx->osd);
-    return m_property_double_ro(action, arg, vo_res.display_par);
+
+    if (!mpctx->video_out || !mpctx->video_out->config_ok)
+        vo_res = (struct mp_osd_res){0};
+
+    double aspect = 1.0 * vo_res.w / MPMAX(vo_res.h, 1) /
+                    (vo_res.display_par ? vo_res.display_par : 1);
+
+    struct m_sub_property props[] = {
+        {"w",       SUB_PROP_DOUBLE(vo_res.w)},
+        {"h",       SUB_PROP_DOUBLE(vo_res.h)},
+        {"par",     SUB_PROP_DOUBLE(vo_res.display_par)},
+        {"aspect",  SUB_PROP_DOUBLE(aspect)},
+        {"mt",      SUB_PROP_DOUBLE(vo_res.mt)},
+        {"mb",      SUB_PROP_DOUBLE(vo_res.mb)},
+        {"ml",      SUB_PROP_DOUBLE(vo_res.ml)},
+        {"mr",      SUB_PROP_DOUBLE(vo_res.mr)},
+        {0}
+    };
+
+    return m_property_read_sub(props, action, arg);
 }
 
 static int mp_property_osd_sym(void *ctx, struct m_property *prop,
@@ -3398,9 +3411,10 @@ static const struct m_property mp_properties_base[] = {
     {"estimated-frame-count", mp_property_frame_count},
     {"estimated-frame-number", mp_property_frame_number},
 
-    {"osd-width", mp_property_osd_w},
-    {"osd-height", mp_property_osd_h},
-    {"osd-par", mp_property_osd_par},
+    {"osd-dimensions", mp_property_osd_dim},
+    M_PROPERTY_ALIAS("osd-width", "osd-dimensions/w"),
+    M_PROPERTY_ALIAS("osd-height", "osd-dimensions/h"),
+    M_PROPERTY_ALIAS("osd-par", "osd-dimensions/par"),
 
     {"osd-sym-cc", mp_property_osd_sym},
     {"osd-ass-cc", mp_property_osd_ass},
@@ -3494,7 +3508,7 @@ static const char *const *const mp_event_property_change[] = {
     E(MPV_EVENT_VIDEO_RECONFIG, "video-out-params", "video-params",
       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
       "width", "height", "fps", "aspect", "vo-configured", "current-vo",
-      "video-aspect", "video-dec-params",
+      "video-aspect", "video-dec-params", "osd-dimensions",
       "hwdec", "hwdec-current", "hwdec-interop"),
     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
       "samplerate", "channels", "audio", "volume", "mute",
@@ -3509,9 +3523,8 @@ static const char *const *const mp_event_property_change[] = {
       "demuxer-cache-time", "cache-buffering-state", "cache-speed",
       "demuxer-cache-state"),
     E(MP_EVENT_WIN_RESIZE, "current-window-scale", "osd-width", "osd-height",
-      "osd-par"),
-    E(MP_EVENT_WIN_STATE, "window-minimized", "display-names", "display-fps",
-      "fullscreen", "window-maximized"),
+      "osd-par", "osd-dimensions"),
+    E(MP_EVENT_WIN_STATE, "display-names", "display-fps", "display-hidpi-scale"),
     E(MP_EVENT_CHANGE_PLAYLIST, "playlist", "playlist-pos", "playlist-pos-1",
       "playlist-count", "playlist/count"),
     E(MP_EVENT_CORE_IDLE, "core-idle", "eof-reached"),
@@ -4732,7 +4745,7 @@ static void cmd_sub_step_seek(void *p)
         if (sub_control(sub, SD_CTRL_SUB_STEP, a) > 0) {
             if (step) {
                 mpctx->opts->subs_rend->sub_delay -= a[0] - refpts;
-                m_config_notify_change_opt_ptr(mpctx->mconfig,
+                m_config_notify_change_opt_ptr_notify(mpctx->mconfig,
                                                &mpctx->opts->subs_rend->sub_delay);
                 show_property_osd(mpctx, "sub-delay", cmd->on_osd);
             } else {

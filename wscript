@@ -414,7 +414,7 @@ iconv support use --disable-iconv.",
     }, {
         'name': '--libarchive',
         'desc': 'libarchive wrapper for reading zip files and more',
-        'func': check_pkg_config('libarchive >= 3.0.0'),
+        'func': check_pkg_config('libarchive >= 3.4.0'),
     }, {
         'name': '--dvbin',
         'desc': 'DVB input module',
@@ -887,8 +887,13 @@ hwaccel_features = [
         'func': check_pkg_config('ffnvcodec >= 8.2.15.7'),
     }, {
         'name': '--cuda-hwaccel',
-        'desc': 'CUDA hwaccel',
-        'deps': '(gl || vulkan) && ffnvcodec',
+        'desc': 'CUDA acceleration',
+        'deps': 'ffnvcodec',
+        'func': check_true,
+    }, {
+        'name': '--cuda-interop',
+        'desc': 'CUDA with graphics interop',
+        'deps': '(gl || vulkan) && cuda-hwaccel',
         'func': check_true,
     }, {
         'name': '--rpi-mmal',
